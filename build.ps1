@@ -73,6 +73,11 @@ function Test-CommandExists {
     $null -ne (Get-Command $Command -ErrorAction SilentlyContinue)
 }
 
+# Function to refresh environment PATH
+function Refresh-Path {
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+}
+
 # Function to install using winget
 function Install-WithWinget {
     param($PackageId, $Name)
@@ -82,14 +87,23 @@ function Install-WithWinget {
         return $false
     }
     
-    Write-Info "Installing $Name via winget..."
+    Write-Info "Installing $Name via winget (this may take a few minutes)..."
     try {
-        winget install --id $PackageId --silent --accept-source-agreements --accept-package-agreements
-        Write-Success "$Name installed successfully"
-        Write-Warning "Please restart your PowerShell session or run: refreshenv"
-        return $true
+        $process = Start-Process -FilePath "winget" -ArgumentList "install", "--id", $PackageId, "--silent", "--accept-source-agreements", "--accept-package-agreements" -NoNewWindow -PassThru -Wait
+        
+        if ($process.ExitCode -eq 0 -or $process.ExitCode -eq -1978335189) {
+            # Exit code -1978335189 means already installed
+            Write-Success "$Name installed successfully"
+            Refresh-Path
+            return $true
+        } else {
+            Write-Warning "$Name installation returned exit code $($process.ExitCode)"
+            Refresh-Path
+            return $true  # Try to continue anyway
+        }
     } catch {
-        Write-Error "Failed to install $Name"
+        $errorMsg = $_.Exception.Message
+        Write-Error "Failed to install ${Name}: $errorMsg"
         return $false
     }
 }
@@ -101,50 +115,104 @@ function Install-WithWinget {
 if (-not $SkipChecks) {
     Write-Step "Checking dependencies..."
     
+    # Refresh PATH to pick up recently installed tools
+    Refresh-Path
+    
     # Check Rust
     if (-not (Test-CommandExists "cargo")) {
         Write-Warning "Rust/Cargo not found!"
-        Write-Info "Installing Rust..."
         
         if (Install-WithWinget "Rustlang.Rustup" "Rust") {
-            Write-Info "Refreshing environment variables..."
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            Refresh-Path
+            
+            # rustup might need initial setup
+            if (Test-CommandExists "rustup") {
+                Write-Info "Setting up Rust with GNU toolchain (lighter, no Visual Studio required)..."
+                rustup toolchain install stable-x86_64-pc-windows-gnu 2>&1 | Out-Null
+                rustup default stable-x86_64-pc-windows-gnu 2>&1 | Out-Null
+                Refresh-Path
+            }
+            
+            if (-not (Test-CommandExists "cargo")) {
+                Write-Error "Rust installation completed but cargo is not available. Please restart your terminal and try again."
+                exit 1
+            }
         } else {
             Write-Error "Please install Rust manually from https://rustup.rs/ and re-run this script."
             exit 1
         }
-    } else {
-        $rustVersion = (cargo --version) -replace 'cargo ', ''
-        Write-Success "Rust found: $rustVersion"
+    }
+    
+    $rustVersion = (cargo --version) -replace 'cargo ', ''
+    $rustToolchain = (rustup show active-toolchain 2>&1) -replace ' \(.*\)', ''
+    Write-Success "Rust found: $rustVersion ($rustToolchain)"
+    
+    # Ensure we have a working linker for Rust
+    if ($rustToolchain -like "*windows-gnu*") {
+        if (-not (Test-CommandExists "gcc")) {
+            Write-Warning "GCC linker not found. Installing MinGW-w64..."
+            
+            # Install MSYS2 which includes MinGW
+            if (Install-WithWinget "MSYS2.MSYS2" "MSYS2") {
+                Refresh-Path
+                
+                # Install MinGW-w64 GCC
+                Write-Info "Installing MinGW-w64 GCC compiler..."
+                & C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm mingw-w64-x86_64-gcc" 2>&1 | Out-Null
+                
+                # Add to PATH
+                $mingwPath = "C:\msys64\mingw64\bin"
+                $currentPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+                if ($currentPath -notlike "*$mingwPath*") {
+                    [System.Environment]::SetEnvironmentVariable("Path", "$currentPath;$mingwPath", "User")
+                    Write-Info "Added MinGW to PATH"
+                }
+                Refresh-Path
+                
+                if (-not (Test-CommandExists "gcc")) {
+                    Write-Error "Failed to install GCC. Please install manually or switch to MSVC toolchain."
+                    exit 1
+                }
+                Write-Success "GCC linker installed"
+            }
+        } else {
+            $gccVersion = (gcc --version | Select-Object -First 1) -replace '.* ', '' -replace ' .*', ''
+            Write-Success "GCC found: $gccVersion"
+        }
     }
     
     # Check Node.js
     if (-not (Test-CommandExists "node")) {
         Write-Warning "Node.js not found!"
-        Write-Info "Installing Node.js..."
         
         if (Install-WithWinget "OpenJS.NodeJS.LTS" "Node.js") {
-            Write-Info "Refreshing environment variables..."
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            Refresh-Path
+            
+            if (-not (Test-CommandExists "node")) {
+                Write-Error "Node.js installation completed but node is not available. Please restart your terminal and try again."
+                exit 1
+            }
         } else {
             Write-Error "Please install Node.js manually from https://nodejs.org/ and re-run this script."
             exit 1
         }
-    } else {
-        $nodeVersion = node --version
-        $npmVersion = npm --version
-        Write-Success "Node.js found: $nodeVersion"
-        Write-Success "npm found: v$npmVersion"
     }
+    
+    $nodeVersion = node --version
+    $npmVersion = npm --version
+    Write-Success "Node.js found: $nodeVersion"
+    Write-Success "npm found: v$npmVersion"
     
     # Check wasm-pack
     if (-not (Test-CommandExists "wasm-pack")) {
         Write-Warning "wasm-pack not found. Installing..."
-        try {
-            cargo install wasm-pack
+        $wasmInstall = cargo install wasm-pack 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Refresh-Path
             Write-Success "wasm-pack installed"
-        } catch {
-            Write-Error "Failed to install wasm-pack. Please install manually: cargo install wasm-pack"
+        } else {
+            Write-Error "Failed to install wasm-pack. Error: $wasmInstall"
+            Write-Error "You may need Visual Studio Build Tools. Run: winget install 'Microsoft.VisualStudio.2022.BuildTools' --silent --override '--wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'"
             exit 1
         }
     } else {
@@ -189,52 +257,58 @@ $buildMode = if ($DevBuild) { "" } else { "--release" }
 $buildModeStr = if ($DevBuild) { "debug" } else { "release" }
 
 Write-Info "Building in $buildModeStr mode..."
-try {
-    if ($buildMode) {
-        cargo build --all $buildMode
-    } else {
-        cargo build --all
-    }
-    Write-Success "Rust workspace built successfully in $buildModeStr mode"
-} catch {
-    Write-Error "Failed to build Rust workspace: $_"
+if ($buildMode) {
+    cargo build --all $buildMode
+} else {
+    cargo build --all
+}
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to build Rust workspace (exit code: $LASTEXITCODE)"
+    Write-Error "You may need Visual Studio Build Tools. Run: winget install 'Microsoft.VisualStudio.2022.BuildTools' --silent --override '--wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'"
     exit 1
 }
+Write-Success "Rust workspace built successfully in $buildModeStr mode"
 
 # ============================================================================
 # STEP 4: Build WASM for Web
 # ============================================================================
 
 Write-Step "Building WASM for web..."
-try {
-    if ($DevBuild) {
-        npm run build:wasm-dev
-    } else {
-        # Build the release version of WASM
-        Set-Location crates/brush-app
+if ($DevBuild) {
+    npm run build:wasm-dev
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to build WASM in dev mode (exit code: $LASTEXITCODE)"
+        exit 1
+    }
+} else {
+    # Build the release version of WASM
+    Push-Location crates/brush-app
+    try {
         if (Test-Path "pkg") { Remove-Item -Recurse -Force pkg }
         wasm-pack build --target web --out-dir ../../brush_nextjs/public/wasm $buildMode
-        Set-Location ../..
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to build WASM (exit code: $LASTEXITCODE)"
+            Pop-Location
+            exit 1
+        }
+    } finally {
+        Pop-Location
     }
-    Write-Success "WASM built successfully"
-} catch {
-    Write-Error "Failed to build WASM: $_"
-    Set-Location $PSScriptRoot
-    exit 1
 }
+Write-Success "WASM built successfully"
 
 # ============================================================================
 # STEP 5: Build Next.js Application
 # ============================================================================
 
 Write-Step "Building Next.js application..."
-try {
-    npm run build
-    Write-Success "Next.js application built successfully"
-} catch {
-    Write-Error "Failed to build Next.js application: $_"
+npm run build
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to build Next.js application (exit code: $LASTEXITCODE)"
     exit 1
 }
+Write-Success "Next.js application built successfully"
 
 # ============================================================================
 # Build Complete

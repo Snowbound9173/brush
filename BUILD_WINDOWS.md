@@ -47,12 +47,26 @@ If you prefer to build manually:
 1. **Rust 1.88+**
    - Install from https://rustup.rs/
    - Or via winget: `winget install Rustlang.Rustup`
+   - The build script uses GNU toolchain by default (lighter, no Visual Studio required)
 
 2. **Node.js LTS**
    - Install from https://nodejs.org/
    - Or via winget: `winget install OpenJS.NodeJS.LTS`
 
-3. **Additional Rust tools**
+3. **C++ Compiler** (automatically installed by build script)
+   - **Option A (Recommended):** MinGW-w64 via MSYS2 (~90MB)
+     ```powershell
+     winget install MSYS2.MSYS2
+     C:\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm mingw-w64-x86_64-gcc"
+     # Add to PATH: C:\msys64\mingw64\bin
+     ```
+   - **Option B:** Visual Studio Build Tools (~6GB)
+     ```powershell
+     winget install "Microsoft.VisualStudio.2022.BuildTools" --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+     rustup default stable-x86_64-pc-windows-msvc
+     ```
+
+4. **Additional Rust tools**
    ```powershell
    rustup target add wasm32-unknown-unknown
    cargo install wasm-pack
